@@ -1,0 +1,44 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Builder tools (downloaded automatically)
+/builder/tools/
+
+# App-local runtime state
+/.transcriptor/
+/runtime_test_home/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.fuse_hidden*
+
+# Logs and debug
+*.log
+*.out
+*.err
+*.png
+
+# Environment
+.env
+.env.local
