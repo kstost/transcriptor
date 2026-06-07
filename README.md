@@ -36,6 +36,7 @@ runtime bindings. Whisper model files are prepared under `~/.transcriptor/`.
 10. [Update and Remove](#update-and-remove)
 11. [Build From Source](#build-from-source)
 12. [How It Works](#how-it-works)
+13. [Disclaimer](#disclaimer)
 
 ---
 
@@ -661,3 +662,20 @@ Runtime directory layout:
 Because audio decoding is handled in-process, installed use does not require an
 external `ffmpeg` binary. Once a model file is present, transcription can run
 without network access.
+
+---
+
+## Disclaimer
+
+This software is provided as is, without warranty of any kind, whether express
+or implied. This includes, but is not limited to, warranties of merchantability,
+fitness for a particular purpose, and non-infringement.
+
+In no event shall the author, copyright holders, or contributors be liable for
+any claim, damages, or other liability arising from the use of, or inability to
+use, this software. This includes, but is not limited to, data loss or
+corruption, system malfunction, security issues, financial loss, and direct,
+indirect, incidental, special, punitive, or consequential damages.
+
+All risks and responsibilities arising from use of this software rest with the
+user.
