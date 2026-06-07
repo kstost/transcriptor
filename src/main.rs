@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use opus_decoder::OpusDecoder;
 use symphonia::{
     core::{
@@ -20,7 +20,9 @@ use symphonia::{
     },
     default::{get_codecs, get_probe},
 };
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, install_logging_hooks,
+};
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_MODEL_NAME: &str = "base";
@@ -29,6 +31,12 @@ const MODEL_ENV: &str = "TRANSCRIPTOR_MODEL";
 const HOME_ENV: &str = "TRANSCRIPTOR_HOME";
 const LANGUAGE_ENV: &str = "TRANSCRIPTOR_LANGUAGE";
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Text,
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Transcribe an audio file to stdout with Whisper")]
@@ -52,6 +60,14 @@ struct Args {
     #[arg(short, long)]
     threads: Option<usize>,
 
+    /// Output format.
+    #[arg(long, value_enum, default_value = "json")]
+    format: OutputFormat,
+
+    /// Print progress and whisper.cpp logs to stderr.
+    #[arg(short, long)]
+    verbose: bool,
+
     /// Do not auto-download the model if it is missing from ~/.transcriptor.
     #[arg(long)]
     no_download: bool,
@@ -59,15 +75,35 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if !args.verbose {
+        install_logging_hooks();
+    }
+
     let transcript = transcribe(&args)?;
-    println!("{}", transcript.trim());
+    print_transcript(&args, transcript.trim())?;
+    Ok(())
+}
+
+fn print_transcript(args: &Args, text: &str) -> Result<()> {
+    match args.format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({ "text": text });
+            println!("{}", serde_json::to_string(&output)?);
+        }
+        OutputFormat::Text => {
+            println!("{text}");
+        }
+    }
+
     Ok(())
 }
 
 fn transcribe(args: &Args) -> Result<String> {
     let model_path = resolve_model_path(args)?;
 
-    eprintln!("Loading model: {}", model_path.display());
+    if args.verbose {
+        eprintln!("Loading model: {}", model_path.display());
+    }
     let ctx = WhisperContext::new_with_params(
         model_path
             .to_str()
@@ -76,7 +112,9 @@ fn transcribe(args: &Args) -> Result<String> {
     )
     .context("failed to load Whisper model")?;
 
-    eprintln!("Decoding audio: {}", args.audio.display());
+    if args.verbose {
+        eprintln!("Decoding audio: {}", args.audio.display());
+    }
     let audio = decode_audio(&args.audio).context("failed to decode audio")?;
     if audio.is_empty() {
         bail!("decoded audio is empty");
@@ -94,7 +132,9 @@ fn transcribe(args: &Args) -> Result<String> {
         params.set_language(Some(language));
     }
 
-    eprintln!("Transcribing...");
+    if args.verbose {
+        eprintln!("Transcribing...");
+    }
     let mut state = ctx
         .create_state()
         .context("failed to create Whisper state")?;
@@ -173,7 +213,7 @@ fn resolve_model_path(args: &Args) -> Result<PathBuf> {
         );
     }
 
-    download_model(&args.model_name, &path)?;
+    download_model(&args.model_name, &path, args.verbose)?;
     Ok(path)
 }
 
@@ -230,7 +270,7 @@ fn model_file_name(model_name: &str) -> Result<String> {
     }
 }
 
-fn download_model(model_name: &str, destination: &Path) -> Result<()> {
+fn download_model(model_name: &str, destination: &Path, verbose: bool) -> Result<()> {
     let file_name = model_file_name(model_name)?;
     let url = format!("{MODEL_BASE_URL}/{file_name}");
     let parent = destination
@@ -253,7 +293,9 @@ fn download_model(model_name: &str, destination: &Path) -> Result<()> {
         })?;
     }
 
-    eprintln!("Downloading model: {url}");
+    if verbose {
+        eprintln!("Downloading model: {url}");
+    }
     let response = ureq::get(&url)
         .call()
         .map_err(|err| anyhow!("failed to download model from {url}: {err}"))?;
@@ -282,7 +324,9 @@ fn download_model(model_name: &str, destination: &Path) -> Result<()> {
             destination.display()
         )
     })?;
-    eprintln!("Model saved: {}", destination.display());
+    if verbose {
+        eprintln!("Model saved: {}", destination.display());
+    }
 
     Ok(())
 }

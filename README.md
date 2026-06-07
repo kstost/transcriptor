@@ -1,6 +1,6 @@
 # transcriptor
 
-> 오디오 파일을 Whisper로 전사해서 결과 텍스트만 stdout으로 출력하는 단일 실행 파일 CLI
+> 오디오 파일을 Whisper로 전사해서 JSON 결과만 stdout으로 출력하는 단일 실행 파일 CLI
 
 `transcriptor`는 터미널에서 다음처럼 쓰기 위한 도구입니다.
 
@@ -8,7 +8,7 @@
 transcriptor audio.ogg
 ```
 
-성공하면 전사된 텍스트만 stdout으로 출력합니다. 모델 로딩, 다운로드, 오디오 디코딩 같은 진행 메시지는 stderr로 나가므로 다른 프로그램에서 결과만 파이프로 받기 쉽습니다.
+성공하면 전사 결과 JSON 한 줄만 stdout으로 출력합니다. 기본 실행에서는 모델 로딩, 다운로드, 오디오 디코딩 같은 진행 메시지를 출력하지 않습니다. 진행 로그가 필요할 때만 `--verbose`를 사용합니다.
 
 별도 `ffmpeg`나 서버 프로세스를 요구하지 않습니다. 실행 파일은 오디오 디코딩과 Whisper 실행에 필요한 코드를 포함하고, 필요한 모델 파일은 `~/.transcriptor/` 아래에 준비합니다.
 
@@ -38,8 +38,8 @@ transcriptor audio.ogg
 |---|---|
 | 터미널 | 글자로 명령을 입력하는 창입니다. macOS의 Terminal, Windows Terminal, Linux terminal 같은 앱입니다. |
 | CLI | Command Line Interface의 줄임말입니다. 터미널에서 명령으로 쓰는 프로그램이라는 뜻입니다. |
-| stdout | 프로그램의 표준 출력입니다. `transcriptor`는 전사 결과 텍스트만 stdout으로 출력합니다. |
-| stderr | 오류나 진행 상태를 출력하는 표준 에러입니다. 모델 다운로드, 로딩 상태, 디코딩 상태는 stderr로 출력합니다. |
+| stdout | 프로그램의 표준 출력입니다. `transcriptor`는 기본적으로 전사 결과 JSON만 stdout으로 출력합니다. |
+| stderr | 오류나 진행 상태를 출력하는 표준 에러입니다. 성공한 기본 실행에서는 비어 있고, `--verbose`를 쓰면 진행 상태가 출력됩니다. |
 | Whisper | OpenAI가 공개한 음성 인식 모델 계열입니다. 이 프로젝트는 whisper.cpp 계열 ggml 모델 파일을 사용합니다. |
 | 모델 파일 | Whisper가 음성을 텍스트로 바꾸기 위해 필요한 `.bin` 파일입니다. 기본값은 `ggml-base.bin`입니다. |
 | `~` | 사용자 홈 폴더를 짧게 쓰는 표시입니다. 예를 들어 `~/.transcriptor/`는 내 홈 폴더 안의 `.transcriptor` 폴더입니다. |
@@ -57,13 +57,25 @@ transcriptor audio.ogg
 transcriptor sample.ogg
 ```
 
-### stdout에 텍스트만 출력
+### stdout에 JSON만 출력
 
-다른 명령과 조합하기 쉽도록 전사 결과만 stdout으로 나갑니다.
+다른 명령과 조합하기 쉽도록 기본 출력은 JSON 한 줄만 stdout으로 나갑니다.
 
 ```bash
-transcriptor meeting.ogg > meeting.txt
-transcriptor memo.ogg | pbcopy
+transcriptor meeting.ogg > meeting.json
+transcriptor memo.ogg
+```
+
+출력 예:
+
+```json
+{"text":"지금 여기다가 이렇게 말을 하면 이게 음성 인식이 잘 되는지 지금 테스트를 해보려고 합니다."}
+```
+
+순수 텍스트 출력이 필요하면 `--format text`를 사용합니다.
+
+```bash
+transcriptor --format text memo.ogg
 ```
 
 ### 모델 자동 준비
@@ -115,10 +127,10 @@ transcriptor audio.ogg
 
 처음 실행할 때 기본 모델이 없으면 자동으로 다운로드합니다. 다운로드된 모델은 `~/.transcriptor/models/`에 저장됩니다.
 
-### 4단계: 결과를 파일로 저장
+### 4단계: JSON 결과를 파일로 저장
 
 ```bash
-transcriptor audio.ogg > transcript.txt
+transcriptor audio.ogg > transcript.json
 ```
 
 ---
@@ -182,12 +194,18 @@ transcriptor sample.ogg
 3. 오디오 파일을 디코딩합니다.
 4. 16 kHz mono로 변환합니다.
 5. Whisper 전사를 실행합니다.
-6. 전사 텍스트를 stdout으로 출력합니다.
+6. 전사 결과 JSON을 stdout으로 출력합니다.
 
-진행 메시지는 stderr로 출력됩니다. 그래서 아래처럼 파일로 저장해도 진행 메시지는 터미널에 보이고, 결과 텍스트만 파일에 들어갑니다.
+성공한 기본 실행에서는 stderr에 진행 메시지를 출력하지 않습니다. 아래처럼 저장하면 JSON 결과만 파일에 들어갑니다.
 
 ```bash
-transcriptor sample.ogg > sample.txt
+transcriptor sample.ogg > sample.json
+```
+
+진행 상태와 whisper.cpp 로그를 보고 싶으면 `--verbose`를 붙입니다.
+
+```bash
+transcriptor --verbose sample.ogg > sample.json
 ```
 
 ---
@@ -209,6 +227,8 @@ transcriptor -l auto audio.ogg
 transcriptor --model ~/.transcriptor/models/ggml-small.bin audio.ogg
 transcriptor --model-name small audio.ogg
 transcriptor --threads 4 audio.ogg
+transcriptor --format text audio.ogg
+transcriptor --verbose audio.ogg
 ```
 
 옵션:
@@ -220,6 +240,8 @@ transcriptor --threads 4 audio.ogg
 | `--model-name <MODEL_NAME>` | 자동 다운로드할 모델 이름입니다. 기본값은 `base`입니다. |
 | `-l, --language <LANGUAGE>` | 언어 코드입니다. 예: `ko`, `en`, `ja`, `auto`. 기본값은 `ko`입니다. |
 | `-t, --threads <THREADS>` | 사용할 CPU worker thread 수입니다. 기본값은 사용 가능한 병렬 처리 수입니다. |
+| `--format <FORMAT>` | 출력 포맷입니다. `json` 또는 `text`를 사용할 수 있습니다. 기본값은 `json`입니다. |
+| `-v, --verbose` | 진행 메시지와 whisper.cpp 로그를 stderr로 출력합니다. |
 | `--no-download` | 모델 파일이 없을 때 자동 다운로드하지 않습니다. |
 | `-h, --help` | 도움말을 출력합니다. |
 | `-V, --version` | 버전을 출력합니다. |
@@ -409,7 +431,7 @@ sudo ./install_windows_build_deps.sh
 
 ## 13. 작동 원리
 
-`transcriptor`는 입력 오디오를 Rust 코드에서 직접 디코딩한 뒤 mono 16 kHz float PCM으로 변환합니다. 그 다음 `whisper-rs`를 통해 whisper.cpp 모델을 실행하고, 세그먼트 텍스트를 이어 붙여 stdout으로 출력합니다.
+`transcriptor`는 입력 오디오를 Rust 코드에서 직접 디코딩한 뒤 mono 16 kHz float PCM으로 변환합니다. 그 다음 `whisper-rs`를 통해 whisper.cpp 모델을 실행하고, 세그먼트 텍스트를 이어 붙여 기본 JSON 형태로 stdout에 출력합니다.
 
 기본 런타임 파일은 `~/.transcriptor/` 아래에 둡니다.
 
