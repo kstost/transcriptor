@@ -38,11 +38,12 @@ runtime bindings. Whisper model files are prepared under `~/.transcriptor/`.
 7. [Environment Variables](#environment-variables)
 8. [Supported Platforms](#supported-platforms)
 9. [Dependencies](#dependencies)
-10. [Troubleshooting](#troubleshooting)
-11. [Update and Remove](#update-and-remove)
-12. [Build From Source](#build-from-source)
-13. [How It Works](#how-it-works)
-14. [Disclaimer](#disclaimer)
+10. [License and Notices](#license-and-notices)
+11. [Troubleshooting](#troubleshooting)
+12. [Update and Remove](#update-and-remove)
+13. [Build From Source](#build-from-source)
+14. [How It Works](#how-it-works)
+15. [Disclaimer](#disclaimer)
 
 ---
 
@@ -710,6 +711,23 @@ zerovec
 zerovec-derive
 zmij
 ```
+
+---
+
+## License and Notices
+
+`transcriptor` is distributed under the MIT License. See [LICENSE](LICENSE).
+
+The default STT model artifacts are OpenAI Whisper model weights converted to
+whisper.cpp ggml format and hosted by `ggerganov/whisper.cpp` on Hugging Face.
+OpenAI Whisper code and model weights are released under the MIT License, and
+whisper.cpp is also released under the MIT License.
+
+Runtime model files, upstream projects, and usage caveats are summarized in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+User-provided audio and generated transcripts may be subject to separate rights
+or consent requirements that are not covered by the software/model licenses.
 
 ---
 
