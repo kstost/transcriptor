@@ -16,6 +16,11 @@ Default output is one JSON line:
 Successful default runs are quiet on stderr. Progress messages and
 `whisper.cpp` logs are printed only when `--verbose` is used.
 
+Parent applications that spawn `transcriptor` can use `--progress json` to read
+machine-readable progress events from stderr. See
+[SPAWN_INTEGRATION.md](SPAWN_INTEGRATION.md) for the full stream and event
+contract.
+
 `transcriptor` does not call `ffmpeg` or any other external audio conversion
 program. The binary contains the Rust audio decoding path and the Whisper
 runtime bindings. Whisper model files are prepared under `~/.transcriptor/`.
@@ -28,15 +33,16 @@ runtime bindings. Whisper model files are prepared under `~/.transcriptor/`.
 2. [Install](#install)
 3. [Usage](#usage)
 4. [Output Contract](#output-contract)
-5. [Models and Runtime Files](#models-and-runtime-files)
-6. [Environment Variables](#environment-variables)
-7. [Supported Platforms](#supported-platforms)
-8. [Dependencies](#dependencies)
-9. [Troubleshooting](#troubleshooting)
-10. [Update and Remove](#update-and-remove)
-11. [Build From Source](#build-from-source)
-12. [How It Works](#how-it-works)
-13. [Disclaimer](#disclaimer)
+5. [Spawn Integration](#spawn-integration)
+6. [Models and Runtime Files](#models-and-runtime-files)
+7. [Environment Variables](#environment-variables)
+8. [Supported Platforms](#supported-platforms)
+9. [Dependencies](#dependencies)
+10. [Troubleshooting](#troubleshooting)
+11. [Update and Remove](#update-and-remove)
+12. [Build From Source](#build-from-source)
+13. [How It Works](#how-it-works)
+14. [Disclaimer](#disclaimer)
 
 ---
 
@@ -76,6 +82,12 @@ Print plain text instead of JSON:
 
 ```bash
 transcriptor --format text audio.ogg
+```
+
+Set the default Whisper model:
+
+```bash
+transcriptor config set-model small
 ```
 
 Show progress and Whisper logs:
@@ -151,6 +163,7 @@ Basic form:
 
 ```bash
 transcriptor [OPTIONS] <AUDIO>
+transcriptor config <COMMAND>
 ```
 
 Examples:
@@ -161,6 +174,9 @@ transcriptor -l ko audio.ogg
 transcriptor -l auto audio.ogg
 transcriptor --model ~/.transcriptor/models/ggml-small.bin audio.ogg
 transcriptor --model-name small audio.ogg
+transcriptor config set-model small
+transcriptor config get
+transcriptor --progress json audio.ogg
 transcriptor --threads 4 audio.ogg
 transcriptor --format text audio.ogg
 transcriptor --verbose audio.ogg
@@ -172,14 +188,23 @@ Options:
 |---|---|
 | `<AUDIO>` | Audio file to transcribe. |
 | `-m, --model <MODEL>` | Path to a whisper.cpp ggml model file. Overrides `TRANSCRIPTOR_MODEL`. |
-| `--model-name <MODEL_NAME>` | Model name to auto-download when no model path is set. Default: `base`. |
+| `--model-name <MODEL_NAME>` | Model name to auto-download for this run when no model path is set. Overrides the saved model setting. |
 | `-l, --language <LANGUAGE>` | Language code such as `ko`, `en`, `ja`, or `auto`. Default: `ko`. |
 | `-t, --threads <THREADS>` | CPU worker thread count. Default: available parallelism. |
 | `--format <FORMAT>` | Output format: `json` or `text`. Default: `json`. |
+| `--progress <PROGRESS>` | Progress event output: `none` or `json`. Default: `none`. |
 | `-v, --verbose` | Print progress messages and `whisper.cpp` logs to stderr. |
 | `--no-download` | Do not auto-download a missing model. |
 | `-h, --help` | Print help. |
 | `-V, --version` | Print version. |
+
+Config commands:
+
+| Command | Meaning |
+|---|---|
+| `transcriptor config get` | Show the saved default model. |
+| `transcriptor config set-model <MODEL_NAME>` | Save a default model name such as `small` or `large-v3-turbo`. |
+| `transcriptor config unset-model` | Remove the saved model setting and return to `base`. |
 
 ---
 
@@ -208,6 +233,119 @@ by a newline.
 When `--verbose` is used, stdout keeps the selected output format and stderr
 receives progress messages plus `whisper.cpp` logs.
 
+When `--progress json` is used, stdout still keeps the selected output format.
+stderr receives newline-delimited JSON events for model readiness and, when
+needed, model download progress. Do not combine `--progress json` with
+`--verbose` if the parent process expects every stderr line to be JSON. Runtime
+errors and CLI parse errors are also emitted as JSON events when
+`--progress json` is present. Each progress event is flushed after its newline.
+
+Every progress event includes these common fields:
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Progress event schema version. Current value: `1`. |
+| `sequence` | Monotonic event sequence number from this process. |
+| `timestamp_unix_ms` | Event timestamp in Unix milliseconds. |
+| `event` | Event name. |
+
+Common event flow when the model must be downloaded:
+
+```text
+process_started
+transcription_started
+audio_decode_started
+audio_decode_finished
+model_download_required
+model_download_started
+model_download_progress
+model_download_finished
+model_ready
+model_load_started
+model_load_finished
+whisper_inference_started
+whisper_inference_finished
+transcription_finished
+process_finished
+```
+
+Common event flow when the model is already available:
+
+```text
+process_started
+transcription_started
+audio_decode_started
+audio_decode_finished
+model_ready
+model_load_started
+model_load_finished
+whisper_inference_started
+whisper_inference_finished
+transcription_finished
+process_finished
+```
+
+If an explicit `--model` path or `TRANSCRIPTOR_MODEL` path is invalid, a
+`model_unavailable` event is emitted before the error event.
+
+Invalid config and invalid `--model-name` values fail before audio decoding.
+
+If the audio file is broken or unsupported, `audio_decode_failed` is emitted
+before the error event. The model is not downloaded or loaded in that case.
+
+Example stderr events:
+
+```json
+{"schema_version":1,"sequence":5,"timestamp_unix_ms":1760000000000,"event":"model_download_required","source":"auto","model_name":"small","path":"/home/me/.transcriptor/models/ggml-small.bin","download_required":true}
+{"schema_version":1,"sequence":6,"timestamp_unix_ms":1760000000200,"event":"model_download_started","model_name":"small","path":"/home/me/.transcriptor/models/ggml-small.bin","downloaded_bytes":0,"total_bytes":488377186,"percent":0.0,"url":"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"}
+{"schema_version":1,"sequence":7,"timestamp_unix_ms":1760000000450,"event":"model_download_progress","model_name":"small","path":"/home/me/.transcriptor/models/ggml-small.bin","downloaded_bytes":1048576,"total_bytes":488377186,"percent":0.214704}
+{"schema_version":1,"sequence":8,"timestamp_unix_ms":1760000012000,"event":"model_download_finished","model_name":"small","path":"/home/me/.transcriptor/models/ggml-small.bin","downloaded_bytes":488377186,"total_bytes":488377186,"percent":100.0}
+{"schema_version":1,"sequence":9,"timestamp_unix_ms":1760000012001,"event":"model_ready","source":"download","model_name":"small","path":"/home/me/.transcriptor/models/ggml-small.bin","download_required":true}
+```
+
+If the model is already available, no download events are emitted. The parent
+process receives a readiness event instead:
+
+```json
+{"schema_version":1,"sequence":5,"timestamp_unix_ms":1760000000000,"event":"model_ready","source":"cache","model_name":"small","path":"/home/me/.transcriptor/models/ggml-small.bin","download_required":false}
+```
+
+Broken audio example:
+
+```json
+{"schema_version":1,"sequence":4,"timestamp_unix_ms":1760000000001,"event":"audio_decode_failed","audio_path":"broken.ogg","message":"failed to decode audio","causes":["failed to decode audio","failed to probe audio format","unsupported feature: core (probe): no suitable format reader found"]}
+```
+
+Runtime error example:
+
+```json
+{"schema_version":1,"sequence":5,"timestamp_unix_ms":1760000000002,"event":"error","error_type":"runtime","exit_code":1,"message":"failed to decode audio","causes":["failed to decode audio","failed to probe audio format","unsupported feature: core (probe): no suitable format reader found"]}
+```
+
+---
+
+## Spawn Integration
+
+Applications that spawn `transcriptor` should use:
+
+```bash
+transcriptor --progress json audio.ogg
+```
+
+In this mode, stdout remains reserved for the final transcription result, and
+stderr becomes a newline-delimited JSON event stream. The parent process can use
+events such as `model_ready`, `model_download_required`,
+`model_download_progress`, `audio_decode_started`,
+`whisper_inference_started`, `transcription_finished`, `error`, and
+`process_finished` to drive its UI or job state.
+
+Because stdout and stderr are separate streams, parent applications should drain
+stdout until EOF before parsing the final transcript.
+
+The detailed spawn contract, event schema, event ordering, error behavior, and
+Node.js/Python parsing examples are documented in
+[SPAWN_INTEGRATION.md](SPAWN_INTEGRATION.md).
+
 ---
 
 ## Models and Runtime Files
@@ -216,6 +354,12 @@ Default runtime directory:
 
 ```text
 ~/.transcriptor/
+```
+
+Default config file:
+
+```text
+~/.transcriptor/config.json
 ```
 
 Default model path:
@@ -228,7 +372,9 @@ Model selection priority:
 
 1. `--model <PATH>`
 2. `TRANSCRIPTOR_MODEL`
-3. `~/.transcriptor/models/ggml-<model-name>.bin`
+3. `--model-name <MODEL_NAME>`
+4. saved `model_name` from `~/.transcriptor/config.json`
+5. built-in default model name: `base`
 
 The default model name is `base`. This maps to:
 
@@ -236,10 +382,50 @@ The default model name is `base`. This maps to:
 ggml-base.bin
 ```
 
+Model names come from the whisper.cpp ggml model files. `transcriptor` maps a
+name such as `small` to `ggml-small.bin` and downloads it from the default model
+source when it is missing.
+
+Common model names:
+
+| Model name | Disk size | Notes |
+|---|---:|---|
+| `tiny` | 75 MiB | Fastest, lowest accuracy. |
+| `base` | 142 MiB | Built-in default. |
+| `small` | 466 MiB | Good default upgrade for Korean transcription. |
+| `medium` | 1.5 GiB | Higher accuracy, slower CPU use. |
+| `large-v3` | 2.9 GiB | High accuracy, largest common model. |
+| `large-v3-turbo` | 1.5 GiB | Strong accuracy with better speed than full large. |
+
+Useful variants:
+
+| Suffix | Meaning |
+|---|---|
+| `.en` | English-only model. Do not use for Korean audio. |
+| `q5_0`, `q5_1`, `q8_0` | Quantized models. Smaller downloads and lower memory use, with possible accuracy loss. |
+
+Set a persistent default model:
+
+```bash
+transcriptor config set-model small
+```
+
+Show the current persistent setting:
+
+```bash
+transcriptor config get
+```
+
 Use a different auto-download model:
 
 ```bash
 transcriptor --model-name small audio.ogg
+```
+
+Stream model status and download progress for a parent process:
+
+```bash
+transcriptor --progress json audio.ogg
 ```
 
 Use a model file that is already present:
@@ -258,6 +444,12 @@ The default model download source is:
 
 ```text
 https://huggingface.co/ggerganov/whisper.cpp/resolve/main
+```
+
+The upstream model list is published at:
+
+```text
+https://huggingface.co/ggerganov/whisper.cpp
 ```
 
 ---
@@ -641,8 +833,8 @@ sudo ./install_windows_build_deps.sh
 
 ## How It Works
 
-1. Resolve the model path from CLI options, environment variables, or the
-   default `~/.transcriptor/models/ggml-base.bin`.
+1. Resolve the model path from CLI options, environment variables, saved config,
+   or the built-in default model name.
 2. Download the model if it is missing and downloads are allowed.
 3. Decode the input audio in Rust.
 4. Downmix to mono.
@@ -655,6 +847,7 @@ Runtime directory layout:
 
 ```text
 ~/.transcriptor/
+|-- config.json
 `-- models/
     `-- ggml-base.bin
 ```

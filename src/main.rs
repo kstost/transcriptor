@@ -2,12 +2,14 @@ use std::{
     env,
     ffi::OsStr,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use opus_decoder::OpusDecoder;
 use symphonia::{
     core::{
@@ -30,7 +32,13 @@ const DEFAULT_LANGUAGE: &str = "ko";
 const MODEL_ENV: &str = "TRANSCRIPTOR_MODEL";
 const HOME_ENV: &str = "TRANSCRIPTOR_HOME";
 const LANGUAGE_ENV: &str = "TRANSCRIPTOR_LANGUAGE";
+const CONFIG_FILE_NAME: &str = "config.json";
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+const DOWNLOAD_PROGRESS_BYTES: u64 = 1024 * 1024;
+const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const PROGRESS_SCHEMA_VERSION: u32 = 1;
+
+static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFormat {
@@ -38,19 +46,63 @@ enum OutputFormat {
     Text,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ProgressFormat {
+    None,
+    Json,
+}
+
 #[derive(Debug, Parser)]
-#[command(version, about = "Transcribe an audio file to stdout with Whisper")]
-struct Args {
+#[command(
+    version,
+    about = "Transcribe an audio file to stdout with Whisper",
+    args_conflicts_with_subcommands = true,
+    subcommand_precedence_over_arg = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    transcribe: TranscribeArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Read or update persistent transcriptor settings.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Show the configured default model.
+    Get,
+
+    /// Set the default model name used when no model path or model name is passed.
+    SetModel {
+        /// Model name such as base, small, medium, large-v3, or large-v3-turbo.
+        model_name: String,
+    },
+
+    /// Reset the configured default model back to base.
+    UnsetModel,
+}
+
+#[derive(Debug, ClapArgs)]
+struct TranscribeArgs {
     /// Audio file to transcribe.
-    audio: PathBuf,
+    audio: Option<PathBuf>,
 
     /// Path to a whisper.cpp ggml model file. Overrides TRANSCRIPTOR_MODEL.
     #[arg(short, long)]
     model: Option<PathBuf>,
 
     /// Model name to auto-download when --model and TRANSCRIPTOR_MODEL are not set.
-    #[arg(long, default_value = DEFAULT_MODEL_NAME)]
-    model_name: String,
+    #[arg(long)]
+    model_name: Option<String>,
 
     /// Language code such as ko, en, ja, or auto. Defaults to ko.
     #[arg(short, long)]
@@ -64,6 +116,10 @@ struct Args {
     #[arg(long, value_enum, default_value = "json")]
     format: OutputFormat,
 
+    /// Emit machine-readable progress events to stderr.
+    #[arg(long, value_enum, default_value = "none")]
+    progress: ProgressFormat,
+
     /// Print progress and whisper.cpp logs to stderr.
     #[arg(short, long)]
     verbose: bool,
@@ -73,8 +129,65 @@ struct Args {
     no_download: bool,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn main() {
+    let args: Vec<_> = env::args_os().collect();
+    let parse_errors_as_json = args_request_json_progress(&args);
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            if parse_errors_as_json
+                && !matches!(
+                    err.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                )
+            {
+                let message = err.to_string();
+                let causes = vec![message.clone()];
+                let _ = emit_error_event(
+                    ProgressFormat::Json,
+                    "cli_parse",
+                    err.exit_code(),
+                    &message,
+                    &causes,
+                );
+                let _ = emit_process_finished(ProgressFormat::Json, false, err.exit_code());
+                std::process::exit(err.exit_code());
+            }
+
+            err.exit();
+        }
+    };
+    let progress = cli.transcribe.progress;
+
+    let _ = emit_process_started(progress);
+    if let Err(err) = run(cli) {
+        if progress == ProgressFormat::Json {
+            let causes = error_causes(&err);
+            let message = causes
+                .first()
+                .map(String::as_str)
+                .unwrap_or("runtime error");
+            let _ = emit_error_event(progress, "runtime", 1, message, &causes);
+            let _ = emit_process_finished(progress, false, 1);
+        } else {
+            eprintln!("Error: {err:?}");
+        }
+        std::process::exit(1);
+    }
+
+    let _ = emit_process_finished(progress, true, 0);
+}
+
+fn run(cli: Cli) -> Result<()> {
+    if let Some(command) = cli.command {
+        return run_command(command);
+    }
+
+    let args = cli.transcribe;
+    if args.audio.is_none() {
+        bail!("missing audio file; run `transcriptor --help` for usage");
+    }
+
     if !args.verbose {
         install_logging_hooks();
     }
@@ -84,7 +197,48 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_transcript(args: &Args, text: &str) -> Result<()> {
+fn run_command(command: Command) -> Result<()> {
+    match command {
+        Command::Config { command } => run_config_command(command),
+    }
+}
+
+fn run_config_command(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Get => {
+            let config = load_config()?;
+            let model_name = config
+                .model_name
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MODEL_NAME.to_string());
+            let source = if config.model_name.is_some() {
+                "config"
+            } else {
+                "default"
+            };
+            println!("model_name={model_name}");
+            println!("source={source}");
+            println!("config={}", config_path()?.display());
+        }
+        ConfigCommand::SetModel { model_name } => {
+            let model_name = normalize_model_name(&model_name)?;
+            let mut config = load_config()?;
+            config.model_name = Some(model_name.clone());
+            save_config(&config)?;
+            println!("Default model set to {model_name}");
+        }
+        ConfigCommand::UnsetModel => {
+            let mut config = load_config()?;
+            config.model_name = None;
+            save_config(&config)?;
+            println!("Default model reset to {DEFAULT_MODEL_NAME}");
+        }
+    }
+
+    Ok(())
+}
+
+fn print_transcript(args: &TranscribeArgs, text: &str) -> Result<()> {
     match args.format {
         OutputFormat::Json => {
             let output = serde_json::json!({ "text": text });
@@ -95,15 +249,51 @@ fn print_transcript(args: &Args, text: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    io::stdout().flush().context("failed to flush stdout")
 }
 
-fn transcribe(args: &Args) -> Result<String> {
+fn transcribe(args: &TranscribeArgs) -> Result<String> {
+    let audio_path = args
+        .audio
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing audio file; run `transcriptor --help` for usage"))?;
+    emit_transcription_started(args.progress, audio_path)?;
+    validate_model_selection(args)?;
+
+    if args.verbose {
+        eprintln!("Decoding audio: {}", audio_path.display());
+    }
+    emit_path_event(
+        args.progress,
+        "audio_decode_started",
+        "audio_path",
+        audio_path,
+    )?;
+    let audio = match decode_audio(audio_path).context("failed to decode audio") {
+        Ok(audio) => audio,
+        Err(err) => {
+            emit_audio_decode_failed(args.progress, audio_path, &err)?;
+            return Err(err);
+        }
+    };
+    if audio.is_empty() {
+        let err = anyhow!("decoded audio is empty");
+        emit_audio_decode_failed(args.progress, audio_path, &err)?;
+        return Err(err);
+    }
+    emit_audio_decode_finished(args.progress, audio_path, audio.len())?;
+
     let model_path = resolve_model_path(args)?;
 
     if args.verbose {
         eprintln!("Loading model: {}", model_path.display());
     }
+    emit_path_event(
+        args.progress,
+        "model_load_started",
+        "model_path",
+        &model_path,
+    )?;
     let ctx = WhisperContext::new_with_params(
         model_path
             .to_str()
@@ -111,14 +301,12 @@ fn transcribe(args: &Args) -> Result<String> {
         WhisperContextParameters::default(),
     )
     .context("failed to load Whisper model")?;
-
-    if args.verbose {
-        eprintln!("Decoding audio: {}", args.audio.display());
-    }
-    let audio = decode_audio(&args.audio).context("failed to decode audio")?;
-    if audio.is_empty() {
-        bail!("decoded audio is empty");
-    }
+    emit_path_event(
+        args.progress,
+        "model_load_finished",
+        "model_path",
+        &model_path,
+    )?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
     params.set_n_threads(thread_count(args.threads));
@@ -135,15 +323,29 @@ fn transcribe(args: &Args) -> Result<String> {
     if args.verbose {
         eprintln!("Transcribing...");
     }
+    emit_path_event(
+        args.progress,
+        "whisper_inference_started",
+        "model_path",
+        &model_path,
+    )?;
     let mut state = ctx
         .create_state()
         .context("failed to create Whisper state")?;
     state
         .full(params, &audio)
         .context("failed to run Whisper transcription")?;
+    emit_path_event(
+        args.progress,
+        "whisper_inference_finished",
+        "model_path",
+        &model_path,
+    )?;
 
     let mut transcript = String::new();
+    let mut segment_count = 0usize;
     for segment in state.as_iter() {
+        segment_count += 1;
         let text = segment.to_string();
         if !transcript.is_empty()
             && !text.starts_with(char::is_whitespace)
@@ -153,6 +355,7 @@ fn transcribe(args: &Args) -> Result<String> {
         }
         transcript.push_str(&text);
     }
+    emit_transcription_finished(args.progress, transcript.as_str(), segment_count)?;
 
     Ok(transcript)
 }
@@ -176,7 +379,7 @@ fn thread_count(requested: Option<usize>) -> i32 {
     count.min(i32::MAX as usize) as i32
 }
 
-fn resolve_language(args: &Args) -> Option<String> {
+fn resolve_language(args: &TranscribeArgs) -> Option<String> {
     let language = args
         .language
         .clone()
@@ -191,20 +394,75 @@ fn resolve_language(args: &Args) -> Option<String> {
     }
 }
 
-fn resolve_model_path(args: &Args) -> Result<PathBuf> {
+fn resolve_model_path(args: &TranscribeArgs) -> Result<PathBuf> {
     if let Some(path) = &args.model {
-        return ensure_existing_model(path);
+        let path = match ensure_existing_model(path) {
+            Ok(path) => path,
+            Err(err) => {
+                emit_model_event(args.progress, "model_unavailable", "cli", None, path, false)?;
+                return Err(err);
+            }
+        };
+        emit_model_event(args.progress, "model_ready", "cli", None, &path, false)?;
+        return Ok(path);
     }
 
     if let Some(path) = env::var_os(MODEL_ENV).map(PathBuf::from) {
-        return ensure_existing_model(&path);
-    }
-
-    let file_name = model_file_name(&args.model_name)?;
-    let path = transcriptor_home()?.join("models").join(&file_name);
-    if path.exists() {
+        let path = match ensure_existing_model(&path) {
+            Ok(path) => path,
+            Err(err) => {
+                emit_model_event(
+                    args.progress,
+                    "model_unavailable",
+                    "env",
+                    None,
+                    &path,
+                    false,
+                )?;
+                return Err(err);
+            }
+        };
+        emit_model_event(args.progress, "model_ready", "env", None, &path, false)?;
         return Ok(path);
     }
+
+    let model_name = resolve_model_name(args)?;
+    let file_name = model_file_name(&model_name)?;
+    let path = transcriptor_home()?.join("models").join(&file_name);
+    if path.exists() {
+        let path = match ensure_existing_model(&path) {
+            Ok(path) => path,
+            Err(err) => {
+                emit_model_event(
+                    args.progress,
+                    "model_unavailable",
+                    "cache",
+                    Some(&model_name),
+                    &path,
+                    false,
+                )?;
+                return Err(err);
+            }
+        };
+        emit_model_event(
+            args.progress,
+            "model_ready",
+            "cache",
+            Some(&model_name),
+            &path,
+            false,
+        )?;
+        return Ok(path);
+    }
+
+    emit_model_event(
+        args.progress,
+        "model_download_required",
+        "auto",
+        Some(&model_name),
+        &path,
+        true,
+    )?;
 
     if args.no_download {
         bail!(
@@ -213,8 +471,70 @@ fn resolve_model_path(args: &Args) -> Result<PathBuf> {
         );
     }
 
-    download_model(&args.model_name, &path, args.verbose)?;
+    download_model(&model_name, &path, args.verbose, args.progress)?;
+    emit_model_event(
+        args.progress,
+        "model_ready",
+        "download",
+        Some(&model_name),
+        &path,
+        true,
+    )?;
     Ok(path)
+}
+
+fn validate_model_selection(args: &TranscribeArgs) -> Result<()> {
+    if let Some(path) = &args.model {
+        if let Err(err) = ensure_existing_model(path) {
+            emit_model_event(args.progress, "model_unavailable", "cli", None, path, false)?;
+            return Err(err);
+        }
+        return Ok(());
+    }
+
+    if let Some(path) = env::var_os(MODEL_ENV).map(PathBuf::from) {
+        if let Err(err) = ensure_existing_model(&path) {
+            emit_model_event(
+                args.progress,
+                "model_unavailable",
+                "env",
+                None,
+                &path,
+                false,
+            )?;
+            return Err(err);
+        }
+        return Ok(());
+    }
+
+    let model_name = resolve_model_name(args)?;
+    let file_name = model_file_name(&model_name)?;
+    let path = transcriptor_home()?.join("models").join(&file_name);
+    if path.exists()
+        && let Err(err) = ensure_existing_model(&path)
+    {
+        emit_model_event(
+            args.progress,
+            "model_unavailable",
+            "cache",
+            Some(&model_name),
+            &path,
+            false,
+        )?;
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+fn resolve_model_name(args: &TranscribeArgs) -> Result<String> {
+    if let Some(model_name) = &args.model_name {
+        return normalize_model_name(model_name);
+    }
+
+    Ok(load_config()?
+        .model_name
+        .unwrap_or_else(|| DEFAULT_MODEL_NAME.to_string()))
 }
 
 fn ensure_existing_model(path: &Path) -> Result<PathBuf> {
@@ -237,6 +557,71 @@ fn transcriptor_home() -> Result<PathBuf> {
         )
     })?;
     Ok(home.join(".transcriptor"))
+}
+
+fn config_path() -> Result<PathBuf> {
+    Ok(transcriptor_home()?.join(CONFIG_FILE_NAME))
+}
+
+#[derive(Debug, Default)]
+struct Config {
+    model_name: Option<String>,
+}
+
+fn load_config() -> Result<Config> {
+    let path = config_path()?;
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+    parse_config(&text).with_context(|| format!("failed to parse config file: {}", path.display()))
+}
+
+fn save_config(config: &Config) -> Result<()> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
+    }
+
+    fs::write(&path, config_json(config)?)
+        .with_context(|| format!("failed to write config file: {}", path.display()))
+}
+
+fn parse_config(text: &str) -> Result<Config> {
+    if text.trim().is_empty() {
+        return Ok(Config::default());
+    }
+
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("config root must be a JSON object"))?;
+
+    let model_name = match object.get("model_name") {
+        Some(serde_json::Value::String(model_name)) => Some(normalize_model_name(model_name)?),
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => bail!("config field model_name must be a string"),
+    };
+
+    Ok(Config { model_name })
+}
+
+fn config_json(config: &Config) -> Result<String> {
+    let mut object = serde_json::Map::new();
+    if let Some(model_name) = &config.model_name {
+        object.insert(
+            "model_name".to_string(),
+            serde_json::Value::String(model_name.clone()),
+        );
+    }
+
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&serde_json::Value::Object(object))?
+    ))
 }
 
 fn default_home_dir() -> Option<PathBuf> {
@@ -270,7 +655,26 @@ fn model_file_name(model_name: &str) -> Result<String> {
     }
 }
 
-fn download_model(model_name: &str, destination: &Path, verbose: bool) -> Result<()> {
+fn normalize_model_name(model_name: &str) -> Result<String> {
+    let model_name = model_name.trim();
+    model_file_name(model_name)?;
+
+    if let Some(name) = model_name
+        .strip_prefix("ggml-")
+        .and_then(|name| name.strip_suffix(".bin"))
+    {
+        Ok(name.to_string())
+    } else {
+        Ok(model_name.to_string())
+    }
+}
+
+fn download_model(
+    model_name: &str,
+    destination: &Path,
+    verbose: bool,
+    progress: ProgressFormat,
+) -> Result<()> {
     let file_name = model_file_name(model_name)?;
     let url = format!("{MODEL_BASE_URL}/{file_name}");
     let parent = destination
@@ -307,10 +711,31 @@ fn download_model(model_name: &str, destination: &Path, verbose: bool) -> Result
         );
     }
 
+    let total_bytes = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok());
+    emit_download_event(
+        progress,
+        "model_download_started",
+        model_name,
+        destination,
+        Some(&url),
+        0,
+        total_bytes,
+    )?;
+
     let mut reader = response.into_reader();
     let mut file = File::create(&tmp)
         .with_context(|| format!("failed to create temporary model file: {}", tmp.display()))?;
-    let bytes = io::copy(&mut reader, &mut file).context("failed to write downloaded model")?;
+    let bytes = copy_with_download_progress(
+        &mut reader,
+        &mut file,
+        progress,
+        model_name,
+        destination,
+        total_bytes,
+    )
+    .context("failed to write downloaded model")?;
     file.flush().context("failed to flush downloaded model")?;
 
     if bytes == 0 {
@@ -327,8 +752,324 @@ fn download_model(model_name: &str, destination: &Path, verbose: bool) -> Result
     if verbose {
         eprintln!("Model saved: {}", destination.display());
     }
+    emit_download_event(
+        progress,
+        "model_download_finished",
+        model_name,
+        destination,
+        None,
+        bytes,
+        total_bytes,
+    )?;
 
     Ok(())
+}
+
+fn copy_with_download_progress(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    progress: ProgressFormat,
+    model_name: &str,
+    destination: &Path,
+    total_bytes: Option<u64>,
+) -> Result<u64> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    let mut last_emitted_bytes = 0u64;
+    let mut last_emitted_at = Instant::now();
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        writer.write_all(&buffer[..read])?;
+        downloaded = downloaded.saturating_add(read as u64);
+
+        let now = Instant::now();
+        if downloaded.saturating_sub(last_emitted_bytes) >= DOWNLOAD_PROGRESS_BYTES
+            || now.duration_since(last_emitted_at) >= DOWNLOAD_PROGRESS_INTERVAL
+        {
+            emit_download_event(
+                progress,
+                "model_download_progress",
+                model_name,
+                destination,
+                None,
+                downloaded,
+                total_bytes,
+            )?;
+            last_emitted_bytes = downloaded;
+            last_emitted_at = now;
+        }
+    }
+
+    if downloaded != last_emitted_bytes {
+        emit_download_event(
+            progress,
+            "model_download_progress",
+            model_name,
+            destination,
+            None,
+            downloaded,
+            total_bytes,
+        )?;
+    }
+
+    Ok(downloaded)
+}
+
+fn emit_download_event(
+    progress: ProgressFormat,
+    event: &str,
+    model_name: &str,
+    destination: &Path,
+    url: Option<&str>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+) -> Result<()> {
+    if progress != ProgressFormat::Json {
+        return Ok(());
+    }
+
+    let percent = total_bytes
+        .filter(|total| *total > 0)
+        .map(|total| downloaded_bytes as f64 * 100.0 / total as f64);
+    let mut object = progress_event(event);
+    object.insert("model_name".to_string(), serde_json::json!(model_name));
+    object.insert(
+        "path".to_string(),
+        serde_json::json!(destination.display().to_string()),
+    );
+    object.insert(
+        "downloaded_bytes".to_string(),
+        serde_json::json!(downloaded_bytes),
+    );
+    object.insert("total_bytes".to_string(), serde_json::json!(total_bytes));
+    object.insert("percent".to_string(), serde_json::json!(percent));
+    if let Some(url) = url {
+        object.insert("url".to_string(), serde_json::json!(url));
+    }
+
+    emit_progress_object(progress, object)
+}
+
+fn emit_model_event(
+    progress: ProgressFormat,
+    event: &str,
+    source: &str,
+    model_name: Option<&str>,
+    path: &Path,
+    download_required: bool,
+) -> Result<()> {
+    if progress != ProgressFormat::Json {
+        return Ok(());
+    }
+
+    let mut object = progress_event(event);
+    object.insert("source".to_string(), serde_json::json!(source));
+    object.insert("model_name".to_string(), serde_json::json!(model_name));
+    object.insert(
+        "path".to_string(),
+        serde_json::json!(path.display().to_string()),
+    );
+    object.insert(
+        "download_required".to_string(),
+        serde_json::json!(download_required),
+    );
+    emit_progress_object(progress, object)
+}
+
+fn emit_error_event(
+    progress: ProgressFormat,
+    error_type: &str,
+    exit_code: i32,
+    message: &str,
+    causes: &[String],
+) -> Result<()> {
+    if progress != ProgressFormat::Json {
+        return Ok(());
+    }
+
+    let mut object = progress_event("error");
+    object.insert("error_type".to_string(), serde_json::json!(error_type));
+    object.insert("exit_code".to_string(), serde_json::json!(exit_code));
+    object.insert("message".to_string(), serde_json::json!(message));
+    object.insert("causes".to_string(), serde_json::json!(causes));
+    emit_progress_object(progress, object)
+}
+
+fn emit_process_started(progress: ProgressFormat) -> Result<()> {
+    let object = progress_event("process_started");
+    emit_progress_object(progress, object)
+}
+
+fn emit_process_finished(progress: ProgressFormat, success: bool, exit_code: i32) -> Result<()> {
+    let mut object = progress_event("process_finished");
+    object.insert("success".to_string(), serde_json::json!(success));
+    object.insert("exit_code".to_string(), serde_json::json!(exit_code));
+    emit_progress_object(progress, object)
+}
+
+fn emit_transcription_started(progress: ProgressFormat, audio_path: &Path) -> Result<()> {
+    let mut object = progress_event("transcription_started");
+    object.insert(
+        "audio_path".to_string(),
+        serde_json::json!(audio_path.display().to_string()),
+    );
+    emit_progress_object(progress, object)
+}
+
+fn emit_transcription_finished(
+    progress: ProgressFormat,
+    transcript: &str,
+    segment_count: usize,
+) -> Result<()> {
+    let mut object = progress_event("transcription_finished");
+    object.insert(
+        "segment_count".to_string(),
+        serde_json::json!(segment_count),
+    );
+    object.insert(
+        "text_bytes".to_string(),
+        serde_json::json!(transcript.len()),
+    );
+    object.insert(
+        "text_chars".to_string(),
+        serde_json::json!(transcript.chars().count()),
+    );
+    emit_progress_object(progress, object)
+}
+
+fn emit_audio_decode_finished(
+    progress: ProgressFormat,
+    audio_path: &Path,
+    sample_count: usize,
+) -> Result<()> {
+    let mut object = progress_event("audio_decode_finished");
+    object.insert(
+        "audio_path".to_string(),
+        serde_json::json!(audio_path.display().to_string()),
+    );
+    object.insert(
+        "sample_rate".to_string(),
+        serde_json::json!(TARGET_SAMPLE_RATE),
+    );
+    object.insert("sample_count".to_string(), serde_json::json!(sample_count));
+    object.insert(
+        "duration_seconds".to_string(),
+        serde_json::json!(sample_count as f64 / TARGET_SAMPLE_RATE as f64),
+    );
+    emit_progress_object(progress, object)
+}
+
+fn emit_audio_decode_failed(
+    progress: ProgressFormat,
+    audio_path: &Path,
+    err: &anyhow::Error,
+) -> Result<()> {
+    let mut object = progress_event("audio_decode_failed");
+    object.insert(
+        "audio_path".to_string(),
+        serde_json::json!(audio_path.display().to_string()),
+    );
+    let causes = error_causes(err);
+    object.insert(
+        "message".to_string(),
+        serde_json::json!(
+            causes
+                .first()
+                .map(String::as_str)
+                .unwrap_or("failed to decode audio")
+        ),
+    );
+    object.insert("causes".to_string(), serde_json::json!(causes));
+    emit_progress_object(progress, object)
+}
+
+fn emit_path_event(
+    progress: ProgressFormat,
+    event: &str,
+    path_key: &str,
+    path: &Path,
+) -> Result<()> {
+    let mut object = progress_event(event);
+    object.insert(
+        path_key.to_string(),
+        serde_json::json!(path.display().to_string()),
+    );
+    emit_progress_object(progress, object)
+}
+
+fn progress_event(event: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::json!(PROGRESS_SCHEMA_VERSION),
+    );
+    object.insert(
+        "sequence".to_string(),
+        serde_json::json!(EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+    );
+    object.insert(
+        "timestamp_unix_ms".to_string(),
+        serde_json::json!(timestamp_unix_ms()),
+    );
+    object.insert("event".to_string(), serde_json::json!(event));
+    object
+}
+
+fn timestamp_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn emit_progress_object(
+    progress: ProgressFormat,
+    object: serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    if progress != ProgressFormat::Json {
+        return Ok(());
+    }
+
+    let mut stderr = io::stderr().lock();
+    writeln!(
+        stderr,
+        "{}",
+        serde_json::to_string(&serde_json::Value::Object(object))?
+    )?;
+    stderr.flush().context("failed to flush progress event")?;
+    Ok(())
+}
+
+fn args_request_json_progress(args: &[std::ffi::OsString]) -> bool {
+    let mut index = 1;
+    while index < args.len() {
+        if args[index] == "--progress" {
+            return args
+                .get(index + 1)
+                .and_then(|arg| arg.to_str())
+                .is_some_and(|value| value == "json");
+        }
+
+        if let Some(value) = args[index]
+            .to_str()
+            .and_then(|arg| arg.strip_prefix("--progress="))
+        {
+            return value == "json";
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+fn error_causes(err: &anyhow::Error) -> Vec<String> {
+    err.chain().map(|cause| cause.to_string()).collect()
 }
 
 fn decode_audio(path: &Path) -> Result<Vec<f32>> {
@@ -531,9 +1272,35 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_model_names_for_config_storage() {
+        assert_eq!(normalize_model_name(" small ").unwrap(), "small");
+        assert_eq!(
+            normalize_model_name("ggml-large-v3-turbo.bin").unwrap(),
+            "large-v3-turbo"
+        );
+    }
+
+    #[test]
     fn rejects_path_like_model_names() {
         assert!(model_file_name("../base").is_err());
         assert!(model_file_name("nested/base").is_err());
+    }
+
+    #[test]
+    fn parses_config_model_name() {
+        let config = parse_config(r#"{ "model_name": "ggml-small.bin" }"#).unwrap();
+        assert_eq!(config.model_name.as_deref(), Some("small"));
+    }
+
+    #[test]
+    fn serializes_config_model_name() {
+        let config = Config {
+            model_name: Some("large-v3-turbo".to_string()),
+        };
+        assert_eq!(
+            config_json(&config).unwrap(),
+            "{\n  \"model_name\": \"large-v3-turbo\"\n}\n"
+        );
     }
 
     #[test]
